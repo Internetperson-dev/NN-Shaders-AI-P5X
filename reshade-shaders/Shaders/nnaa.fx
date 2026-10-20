@@ -27,6 +27,182 @@
 
 #define K_SIZE 128
 
+// ---------------------------------------------------------------------------
+// Selective NNAA for high-contrast Persona-style UI (experimental).
+// The neural network weights and computations below are unchanged.
+// Each tile corresponds to HUD_TILE_SIZE x HUD_TILE_SIZE NNAA block positions
+// (each NNAA block represents 2x2 final output pixels).
+// Mask3: actual NNAA output; mask2/1/0: successively dilated input support.
+// All masks are rebuilt every frame to avoid temporal/stale texture hazards.
+// ---------------------------------------------------------------------------
+#define HUD_TILE_SIZE 4
+#define HUD_HALF_W (BUFFER_WIDTH / 2)
+#define HUD_HALF_H (BUFFER_HEIGHT / 2)
+#define HUD_TILE_W ((HUD_HALF_W + HUD_TILE_SIZE - 1) / HUD_TILE_SIZE)
+#define HUD_TILE_H ((HUD_HALF_H + HUD_TILE_SIZE - 1) / HUD_TILE_SIZE)
+#define HUD_MASK_DISPATCH_X ((HUD_TILE_W + 7) / 8)
+#define HUD_MASK_DISPATCH_Y ((HUD_TILE_H + 7) / 8)
+
+uniform bool HUD_RestrictZones <
+    ui_label = "Restrict detection to typical P5S HUD areas";
+    ui_tooltip = "True: portrait/dialogue/date/button areas. Turn OFF for full-screen menus or unusual UI positions.";
+> = true;
+
+uniform float HUD_EdgeThreshold <
+    ui_type = "slider";
+    ui_label = "HUD edge contrast";
+    ui_tooltip = "Higher detects fewer edges, faster but risks missing UI details.";
+    ui_min = 0.04; ui_max = 0.40; ui_step = 0.01;
+> = 0.13;
+
+uniform float HUD_BlackThreshold <
+    ui_type = "slider";
+    ui_label = "Black HUD colour ceiling";
+    ui_min = 0.05; ui_max = 0.35; ui_step = 0.01;
+> = 0.20;
+
+uniform float HUD_WhiteThreshold <
+    ui_type = "slider";
+    ui_label = "White HUD colour floor";
+    ui_min = 0.65; ui_max = 0.98; ui_step = 0.01;
+> = 0.80;
+
+uniform bool HUD_DebugMask <
+    ui_label = "Debug: highlight NNAA output tiles in green";
+    ui_tooltip = "Shows which pixels get neural AA; this does not show the expanded support masks.";
+> = false;
+
+bool HUDZone(float2 uv)
+{
+    if (!HUD_RestrictZones) return true;
+    // Approximate regions for the supplied 1080p dialogue screenshot.
+    // Use full-screen mode in menus, cutscenes and other HUD layouts.
+    return (uv.x < 0.31 && uv.y < 0.26) ||
+           (uv.x < 0.41 && uv.y > 0.41) ||
+           (uv.x > 0.22 && uv.x < 0.76 && uv.y > 0.62) ||
+           (uv.x > 0.84 && uv.y > 0.72);
+}
+
+bool HUDPalette(float3 rgb)
+{
+    float mx = max(rgb.r, max(rgb.g, rgb.b));
+    float mn = min(rgb.r, min(rgb.g, rgb.b));
+    float chroma = mx - mn;
+    bool red = rgb.r > 0.55 && rgb.r > rgb.g * 1.70 &&
+               rgb.r > rgb.b * 1.70 && rgb.g < 0.48;
+    bool white = mn > HUD_WhiteThreshold && chroma < 0.18;
+    bool black = mx < HUD_BlackThreshold && chroma < 0.12;
+    return red || white || black;
+}
+
+float HUDColourDelta(float3 a, float3 b)
+{
+    float3 d = abs(a - b);
+    return max(d.r, max(d.g, d.b));
+}
+
+// Half-resolution activity, before tile reduction.
+texture2D texHUDEdges_nnaa1
+{
+    Width = HUD_HALF_W; Height = HUD_HALF_H;
+    MipLevels = 1; Format = R8;
+};
+storage2D storageHUDEdges_nnaa1 { Texture = texHUDEdges_nnaa1; MipLevel = 0; };
+sampler2D samplerHUDEdges_nnaa1 { Texture = texHUDEdges_nnaa1; };
+
+// The output mask and three conservative one-tile dilations.
+texture2D texHUDTile3_nnaa1 { Width = HUD_TILE_W; Height = HUD_TILE_H; MipLevels = 1; Format = R8; };
+storage2D storageHUDTile3_nnaa1 { Texture = texHUDTile3_nnaa1; MipLevel = 0; };
+sampler2D samplerHUDTile3_nnaa1 { Texture = texHUDTile3_nnaa1; };
+texture2D texHUDTile2_nnaa1 { Width = HUD_TILE_W; Height = HUD_TILE_H; MipLevels = 1; Format = R8; };
+storage2D storageHUDTile2_nnaa1 { Texture = texHUDTile2_nnaa1; MipLevel = 0; };
+sampler2D samplerHUDTile2_nnaa1 { Texture = texHUDTile2_nnaa1; };
+texture2D texHUDTile1_nnaa1 { Width = HUD_TILE_W; Height = HUD_TILE_H; MipLevels = 1; Format = R8; };
+storage2D storageHUDTile1_nnaa1 { Texture = texHUDTile1_nnaa1; MipLevel = 0; };
+sampler2D samplerHUDTile1_nnaa1 { Texture = texHUDTile1_nnaa1; };
+texture2D texHUDTile0_nnaa1 { Width = HUD_TILE_W; Height = HUD_TILE_H; MipLevels = 1; Format = R8; };
+storage2D storageHUDTile0_nnaa1 { Texture = texHUDTile0_nnaa1; MipLevel = 0; };
+sampler2D samplerHUDTile0_nnaa1 { Texture = texHUDTile0_nnaa1; };
+
+// Single tile lookup in each expensive convolution pass.
+bool HUDRunConv0(int2 id) { return tex2Dfetch(samplerHUDTile0_nnaa1, id / HUD_TILE_SIZE).r > 0.5; }
+bool HUDRunConv1(int2 id) { return tex2Dfetch(samplerHUDTile1_nnaa1, id / HUD_TILE_SIZE).r > 0.5; }
+bool HUDRunConv2(int2 id) { return tex2Dfetch(samplerHUDTile2_nnaa1, id / HUD_TILE_SIZE).r > 0.5; }
+bool HUDRunConv3(int2 id) { return tex2Dfetch(samplerHUDTile3_nnaa1, id / HUD_TILE_SIZE).r > 0.5; }
+
+[shader("compute")]
+void BuildHUDTiles(int3 id : SV_DispatchThreadID)
+{
+    if (id.x >= HUD_TILE_W || id.y >= HUD_TILE_H) return;
+    float active = 0.0;
+    // A tile is active if ANY underlying half-resolution block has an edge.
+    [loop] for (int y = 0; y < HUD_TILE_SIZE; ++y)
+    {
+        [loop] for (int x = 0; x < HUD_TILE_SIZE; ++x)
+        {
+            int2 p = id.xy * HUD_TILE_SIZE + int2(x, y);
+            if (p.x < HUD_HALF_W && p.y < HUD_HALF_H)
+                active = max(active, tex2Dfetch(samplerHUDEdges_nnaa1, p).r);
+            if (active > 0.5) break;
+        }
+        if (active > 0.5) break;
+    }
+    tex2Dstore(storageHUDTile3_nnaa1, id.xy, float4(active, 0, 0, 0));
+}
+
+// Network layers 1/2/3 use 3x3 neighborhoods of the previous layer's
+// half-resolution block positions. Expanding by one entire tile per
+// convolution gives conservative support across every tile boundary.
+
+[shader("compute")]
+void DilateHUD2(int3 id : SV_DispatchThreadID)
+{
+    if (id.x >= HUD_TILE_W || id.y >= HUD_TILE_H) return;
+    float active = 0.0;
+    [unroll] for (int y = -1; y <= 1; ++y)
+    {
+        [unroll] for (int x = -1; x <= 1; ++x)
+        {
+            int2 p = clamp(id.xy + int2(x, y), int2(0, 0), int2(HUD_TILE_W - 1, HUD_TILE_H - 1));
+            active = max(active, tex2Dfetch(storageHUDTile3_nnaa1, p).r);
+        }
+    }
+    tex2Dstore(storageHUDTile2_nnaa1, id.xy, float4(active, 0, 0, 0));
+}
+
+[shader("compute")]
+void DilateHUD1(int3 id : SV_DispatchThreadID)
+{
+    if (id.x >= HUD_TILE_W || id.y >= HUD_TILE_H) return;
+    float active = 0.0;
+    [unroll] for (int y = -1; y <= 1; ++y)
+    {
+        [unroll] for (int x = -1; x <= 1; ++x)
+        {
+            int2 p = clamp(id.xy + int2(x, y), int2(0, 0), int2(HUD_TILE_W - 1, HUD_TILE_H - 1));
+            active = max(active, tex2Dfetch(storageHUDTile2_nnaa1, p).r);
+        }
+    }
+    tex2Dstore(storageHUDTile1_nnaa1, id.xy, float4(active, 0, 0, 0));
+}
+
+[shader("compute")]
+void DilateHUD0(int3 id : SV_DispatchThreadID)
+{
+    if (id.x >= HUD_TILE_W || id.y >= HUD_TILE_H) return;
+    float active = 0.0;
+    [unroll] for (int y = -1; y <= 1; ++y)
+    {
+        [unroll] for (int x = -1; x <= 1; ++x)
+        {
+            int2 p = clamp(id.xy + int2(x, y), int2(0, 0), int2(HUD_TILE_W - 1, HUD_TILE_H - 1));
+            active = max(active, tex2Dfetch(storageHUDTile1_nnaa1, p).r);
+        }
+    }
+    tex2Dstore(storageHUDTile0_nnaa1, id.xy, float4(active, 0, 0, 0));
+}
+
+
 texture2D texLuma_nnaa1
 {
     Width = BUFFER_WIDTH / 2 + 1;
@@ -91,32 +267,70 @@ sampler2D samplerResult_nnaa1
 [shader("compute")]
 void GetLuma(int3 id : SV_DispatchThreadID)
 {
-    min16float4 luma = float4(
-        dot(tex2Dfetch(ReShade::BackBuffer, id.xy * int2(2, 2) + int2(-1, -1)).rgb, min16float3(0.299, 0.587, 0.114)),
-        dot(tex2Dfetch(ReShade::BackBuffer, id.xy * int2(2, 2) + int2(0, -1)).rgb, min16float3(0.299, 0.587, 0.114)),
-        dot(tex2Dfetch(ReShade::BackBuffer, id.xy * int2(2, 2) + int2(-1, 0)).rgb, min16float3(0.299, 0.587, 0.114)),
-        dot(tex2Dfetch(ReShade::BackBuffer, id.xy * int2(2, 2)).rgb, min16float3(0.299, 0.587, 0.114)));
+    if (id.x > HUD_HALF_W || id.y > HUD_HALF_H) return;
+    int2 p = id.xy * int2(2, 2);
+    min16float3 c00 = tex2Dfetch(ReShade::BackBuffer, p + int2(-1, -1)).rgb;
+    min16float3 c10 = tex2Dfetch(ReShade::BackBuffer, p + int2( 0, -1)).rgb;
+    min16float3 c01 = tex2Dfetch(ReShade::BackBuffer, p + int2(-1,  0)).rgb;
+    min16float3 c11 = tex2Dfetch(ReShade::BackBuffer, p).rgb;
+    min16float4 luma = min16float4(
+        dot(c00, min16float3(0.299, 0.587, 0.114)),
+        dot(c10, min16float3(0.299, 0.587, 0.114)),
+        dot(c01, min16float3(0.299, 0.587, 0.114)),
+        dot(c11, min16float3(0.299, 0.587, 0.114)));
     tex2Dstore(storageLuma_nnaa1, id.xy, luma);
+
+    // Padding (+1) is used by the first convolution; no HUD mask there.
+    if (id.x >= HUD_HALF_W || id.y >= HUD_HALF_H) return;
+    float2 uv = (float2(p) + 0.5) / float2(BUFFER_WIDTH, BUFFER_HEIGHT);
+    float selected = 0.0;
+    if (HUDZone(uv))
+    {
+        // Check the adjacent block boundaries too, so aligned straight
+        // HUD outlines are not missed by the 2x2 block classification.
+        int2 rightPos = min(p + int2(1, 0), int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
+        int2 downPos  = min(p + int2(0, 1), int2(BUFFER_WIDTH - 1, BUFFER_HEIGHT - 1));
+        float3 rightC = tex2Dfetch(ReShade::BackBuffer, rightPos).rgb;
+        float3 downC  = tex2Dfetch(ReShade::BackBuffer, downPos).rgb;
+        bool palette = HUDPalette(c00) || HUDPalette(c10) ||
+                       HUDPalette(c01) || HUDPalette(c11) ||
+                       HUDPalette(rightC) || HUDPalette(downC);
+        float edge = max(max(HUDColourDelta(c00, c10), HUDColourDelta(c00, c01)),
+                         max(HUDColourDelta(c11, c10), HUDColourDelta(c11, c01)));
+        edge = max(edge, HUDColourDelta(c11, rightC));
+        edge = max(edge, HUDColourDelta(c11, downC));
+        selected = (palette && edge >= HUD_EdgeThreshold) ? 1.0 : 0.0;
+    }
+    tex2Dstore(storageHUDEdges_nnaa1, id.xy, float4(selected, 0, 0, 0));
 }
 
 [shader("pixel")]
 float4 ApplyNN(float4 pos : SV_Position) : SV_Target
 {
-	min16float luma = tex2Dfetch(samplerResult_nnaa1, pos.xy).r;
-	
-	min16float4 old_color = tex2Dfetch(ReShade::BackBuffer, pos.xy);
-	
-	min16float y = dot(old_color.rgb, min16float3(0.299, 0.587, 0.114)) + luma;
-	min16float cb = dot(old_color.rgb, min16float3(-0.1687, -0.3313, 0.5));
-	min16float cr = dot(old_color.rgb, min16float3(0.5, -0.4187, -0.0813));
-	
-	return float4(y + 1.402 * cr, y - 0.34414 * cb - 0.71414 * cr, y + 1.772 * cb, old_color.a);
+    float4 old_color = tex2Dfetch(ReShade::BackBuffer, pos.xy);
+    int2 tile = int2(pos.xy) / (HUD_TILE_SIZE * 2);
+    bool active = tex2Dfetch(samplerHUDTile3_nnaa1, tile).r > 0.5;
+    if (HUD_DebugMask)
+    {
+        float3 dbg = active ? lerp(old_color.rgb, float3(0.05, 1.0, 0.10), 0.72) : old_color.rgb;
+        return float4(dbg, old_color.a);
+    }
+    // Crucial: avoid sampling an unwritten correction for inactive pixels.
+    if (!active) return old_color;
+
+    min16float luma = tex2Dfetch(samplerResult_nnaa1, pos.xy).r;
+    min16float y = dot(old_color.rgb, min16float3(0.299, 0.587, 0.114)) + luma;
+    min16float cb = dot(old_color.rgb, min16float3(-0.1687, -0.3313, 0.5));
+    min16float cr = dot(old_color.rgb, min16float3(0.5, -0.4187, -0.0813));
+    return float4(y + 1.402 * cr, y - 0.34414 * cb - 0.71414 * cr,
+                  y + 1.772 * cb, old_color.a);
 }
 
 [shader("compute")]
 void Layer_conv2d(int3 id : SV_DispatchThreadID)
 {
     if(id.x >= (BUFFER_WIDTH / 2)) return;
+    if (!HUDRunConv0(id.xy)) return; // Guaranteed outside support of enabled final pixels.
     min16float4 f_out_0 = min16float4(-0.6973615288734436,0.0008432791801169515,-0.0850953683257103,-0.0003058784350287169);
     min16float4 f_out_1 = min16float4(-0.003087584162130952,-0.0004334215191192925,0.017273960635066032,-0.002340392442420125);
     min16float4 f_out_2 = min16float4(0.010897458530962467,-0.006205008830875158,0.0021861661225557327,-0.26982539892196655);
@@ -732,6 +946,7 @@ void Layer_conv2d(int3 id : SV_DispatchThreadID)
 void Layer_conv2d_1(int3 id : SV_DispatchThreadID)
 {
     if(id.x >= (BUFFER_WIDTH / 2)) return;
+    if (!HUDRunConv1(id.xy)) return; // Guaranteed outside support of enabled final pixels.
     min16float4 f_out_0 = min16float4(-0.009917779825627804,0.2634704113006592,0.017698582261800766,0.010656747967004776);
     min16float4 f_out_1 = min16float4(0.015335822477936745,-0.00971568189561367,0.047550834715366364,0.05650793015956879);
     min16float4 f_out_2 = min16float4(0.02690737508237362,-0.0067428662441670895,0.04074980691075325,-0.007586421445012093);
@@ -3195,6 +3410,7 @@ void Layer_conv2d_1(int3 id : SV_DispatchThreadID)
 void Layer_conv2d_2(int3 id : SV_DispatchThreadID)
 {
     if(id.x >= (BUFFER_WIDTH / 2)) return;
+    if (!HUDRunConv2(id.xy)) return; // Guaranteed outside support of enabled final pixels.
     min16float4 f_out_0 = min16float4(0.017496680840849876,0.08427165448665619,-0.010411633178591728,-0.9539769887924194);
     min16float4 f_out_1 = min16float4(-0.050946857780218124,-0.012930448167026043,-0.06556550413370132,0.12563157081604004);
     min16float4 f_out_2 = min16float4(0.00836456660181284,0.28239595890045166,-0.012398926541209221,-0.0032333882991224527);
@@ -5658,6 +5874,7 @@ void Layer_conv2d_2(int3 id : SV_DispatchThreadID)
 void Layer_conv2d_3(int3 id : SV_DispatchThreadID)
 {
     if(id.x >= (BUFFER_WIDTH / 2)) return;
+    if (!HUDRunConv3(id.xy)) return; // Guaranteed outside support of enabled final pixels.
     min16float4 f_out_0 = min16float4(-0.041097745299339294,-0.0547495111823082,-0.055365823209285736,0.2784631848335266);
     min16float4 f_out_1 = min16float4(-0.009016884490847588,-0.08118791878223419,-0.42072445154190063,-0.06305795162916183);
     min16float4 f_out_2 = min16float4(-0.035237766802310944,-0.3492409586906433,0.005304526537656784,-0.4514662027359009);
@@ -8166,7 +8383,7 @@ void Layer_conv2d_3(int3 id : SV_DispatchThreadID)
 #define Y_DISPATCH (BUFFER_HEIGHT / 2)
 
 
-technique Sarenya_NNAA < ui_tooltip = "Sarénya NNAA"; >
+technique Sarenya_NNAA_P5S_Selective < ui_tooltip = "Selective NNAA: colour-edge UI tiles, with debug mask"; >
 {
     pass luma
     {
@@ -8176,6 +8393,32 @@ technique Sarenya_NNAA < ui_tooltip = "Sarénya NNAA"; >
         DispatchSizeY = BUFFER_HEIGHT / (2 * 16) + 1;
     }
 
+
+    // Rebuild masks before any expensive convolutions.
+    pass detect_tiles
+    {
+        ComputeShader = BuildHUDTiles<8, 8>;
+        DispatchSizeX = HUD_MASK_DISPATCH_X;
+        DispatchSizeY = HUD_MASK_DISPATCH_Y;
+    }
+    pass expand_for_conv2
+    {
+        ComputeShader = DilateHUD2<8, 8>;
+        DispatchSizeX = HUD_MASK_DISPATCH_X;
+        DispatchSizeY = HUD_MASK_DISPATCH_Y;
+    }
+    pass expand_for_conv1
+    {
+        ComputeShader = DilateHUD1<8, 8>;
+        DispatchSizeX = HUD_MASK_DISPATCH_X;
+        DispatchSizeY = HUD_MASK_DISPATCH_Y;
+    }
+    pass expand_for_conv0
+    {
+        ComputeShader = DilateHUD0<8, 8>;
+        DispatchSizeX = HUD_MASK_DISPATCH_X;
+        DispatchSizeY = HUD_MASK_DISPATCH_Y;
+    }
 
     pass pass_conv2d
     {
